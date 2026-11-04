@@ -1,0 +1,144 @@
+x-app: &app
+  build: .
+  image: flight-booking:local
+  restart: unless-stopped
+
+x-sentinel: &sentinel
+  image: redis:7.4-alpine
+  command: ["sh", "-c", "cp /etc/redis/sentinel.conf /tmp/sentinel.conf && exec redis-server /tmp/sentinel.conf --sentinel"]
+  volumes:
+    - ./infra/sentinel.conf:/etc/redis/sentinel.conf:ro
+  depends_on:
+    redis-master:
+      condition: service_healthy
+    redis-replica:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+    interval: 3s
+    timeout: 2s
+    retries: 10
+  restart: unless-stopped
+
+services:
+  postgres-flight:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: flights
+      POSTGRES_USER: flight
+      POSTGRES_PASSWORD: ${FLIGHT_DB_PASSWORD:-flight-local}
+    volumes:
+      - flight-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flight -d flights"]
+      interval: 3s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+
+  postgres-booking:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: bookings
+      POSTGRES_USER: booking
+      POSTGRES_PASSWORD: ${BOOKING_DB_PASSWORD:-booking-local}
+    volumes:
+      - booking-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booking -d bookings"]
+      interval: 3s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+
+  redis-master:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  redis-replica:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--replicaof", "redis-master", "6379", "--appendonly", "yes"]
+    volumes:
+      - redis-replica-data:/data
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    restart: unless-stopped
+
+  redis-sentinel-1:
+    <<: *sentinel
+
+  redis-sentinel-2:
+    <<: *sentinel
+
+  redis-sentinel-3:
+    <<: *sentinel
+
+  flight:
+    <<: *app
+    command: ["python", "-m", "flight.server"]
+    environment:
+      DATABASE_URL: postgresql://flight:${FLIGHT_DB_PASSWORD:-flight-local}@postgres-flight:5432/flights
+      GRPC_API_KEY: ${GRPC_API_KEY:-local-flight-key}
+      REDIS_SENTINELS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+      REDIS_MASTER_NAME: mymaster
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+    ports:
+      - "${FLIGHT_GRPC_PORT:-50051}:50051"
+    depends_on:
+      postgres-flight:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      redis-sentinel-2:
+        condition: service_healthy
+      redis-sentinel-3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,grpc,flights_pb2 as p,flights_pb2_grpc as g; g.FlightServiceStub(grpc.insecure_channel('localhost:50051')).GetFlight(p.GetFlightRequest(id='11111111-1111-4111-8111-111111111111'),metadata=(('x-api-key',os.environ['GRPC_API_KEY']),),timeout=2)"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+
+  booking:
+    <<: *app
+    environment:
+      DATABASE_URL: postgresql://booking:${BOOKING_DB_PASSWORD:-booking-local}@postgres-booking:5432/bookings
+      GRPC_API_KEY: ${GRPC_API_KEY:-local-flight-key}
+      FLIGHT_GRPC_TARGET: flight:50051
+      GRPC_TIMEOUT_SECONDS: ${GRPC_TIMEOUT_SECONDS:-2}
+      GRPC_RETRY_BACKOFF_SECONDS: ${GRPC_RETRY_BACKOFF_SECONDS:-0.1}
+      CB_FAILURE_THRESHOLD: ${CB_FAILURE_THRESHOLD:-5}
+      CB_RESET_TIMEOUT_SECONDS: ${CB_RESET_TIMEOUT_SECONDS:-10}
+      CB_WINDOW_SECONDS: ${CB_WINDOW_SECONDS:-30}
+    ports:
+      - "${BOOKING_PORT:-8080}:8000"
+    depends_on:
+      postgres-booking:
+        condition: service_healthy
+      flight:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health',timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  flight-data:
+  booking-data:
+  redis-master-data:
+  redis-replica-data:

@@ -1,0 +1,9 @@
+fastapi==0.115.12
+uvicorn==0.34.2
+psycopg[binary,pool]==3.2.9
+grpcio==1.71.2
+grpcio-tools==1.71.2
+protobuf==5.29.4
+redis==5.2.1
+email-validator==2.2.0
+yoyo-migrations==9.0.0
